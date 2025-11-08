@@ -1,0 +1,10 @@
+Flask==3.0.0
+TTS==0.22.0
+torch==2.1.2
+torchaudio==2.1.2
+numpy==1.24.3
+scipy==1.11.4
+soundfile==0.12.1
+librosa==0.10.1
+pydub==0.25.1
+flask-cors==4.0.0

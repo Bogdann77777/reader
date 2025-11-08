@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTS Reader - Text to Speech with XTTS v2</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>TTS Reader</h1>
+            <p class="subtitle">Text to Speech with XTTS v2 Voice Cloning</p>
+        </header>
+
+        <!-- Status Indicator -->
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-label">Status:</span>
+                <span id="status" class="status-value">Ready</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Position:</span>
+                <span id="position" class="status-value">0 / 0</span>
+            </div>
+        </div>
+
+        <!-- Voice Selection -->
+        <div class="control-section">
+            <label for="voice-select">Select Voice:</label>
+            <select id="voice-select" class="voice-dropdown">
+                <option value="">Loading voices...</option>
+            </select>
+        </div>
+
+        <!-- Speed Control -->
+        <div class="control-section">
+            <label for="speed-slider">Reading Speed: <span id="speed-value">0.5x</span></label>
+            <input type="range" id="speed-slider" class="speed-slider" min="0.2" max="1.0" step="0.1" value="0.5">
+            <div class="speed-labels">
+                <span>0.2x (Very Slow)</span>
+                <span>0.5x (Medium)</span>
+                <span>1.0x (Fast)</span>
+            </div>
+        </div>
+
+        <!-- File Upload Area -->
+        <div class="upload-section">
+            <div id="drop-zone" class="drop-zone">
+                <div class="drop-zone-content">
+                    <svg class="upload-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <h3>Drop text file here</h3>
+                    <p>or click to select</p>
+                    <input type="file" id="file-input" accept=".txt" hidden>
+                </div>
+            </div>
+        </div>
+
+        <!-- Text Display Area -->
+        <div class="text-section">
+            <label for="text-display">Text Content:</label>
+            <textarea id="text-display" class="text-display" placeholder="Your text will appear here after upload..."></textarea>
+            <div class="text-info">
+                <span>Click on text to set start position</span>
+                <span id="text-length">0 characters</span>
+            </div>
+        </div>
+
+        <!-- Chunk Navigation -->
+        <div class="chunk-navigation">
+            <div class="chunk-info">
+                <span class="chunk-label">Chunk:</span>
+                <span id="current-chunk" class="chunk-value">0 / 0</span>
+            </div>
+            <div class="chunk-controls">
+                <button id="prev-chunk-btn" class="btn btn-nav" disabled title="Previous Chunk (←)">
+                    <svg class="btn-icon-small" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/>
+                    </svg>
+                </button>
+                <input type="number" id="chunk-input" class="chunk-input" min="1" placeholder="Go to chunk..." disabled>
+                <button id="go-chunk-btn" class="btn btn-nav" disabled title="Go to Chunk">GO</button>
+                <button id="next-chunk-btn" class="btn btn-nav" disabled title="Next Chunk (→)">
+                    <svg class="btn-icon-small" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- Playback Controls -->
+        <div class="controls-section">
+            <button id="start-btn" class="btn btn-primary" disabled>
+                <svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                </svg>
+                START
+            </button>
+            <button id="stop-btn" class="btn btn-secondary" disabled>
+                <svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="6" y="4" width="4" height="16"></rect>
+                    <rect x="14" y="4" width="4" height="16"></rect>
+                </svg>
+                STOP
+            </button>
+            <button id="cleanup-btn" class="btn btn-danger">
+                <svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+                CLEANUP
+            </button>
+        </div>
+
+        <!-- Progress Bar -->
+        <div class="progress-section">
+            <div class="progress-bar">
+                <div id="progress" class="progress-fill"></div>
+            </div>
+            <div class="progress-text">
+                <span id="progress-label">Ready to start</span>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>TTS Reader v1.0 - Powered by XTTS v2</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

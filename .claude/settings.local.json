@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(powershell -Command \"Get-Content ''D:\\projects\\reader\\fiels passport.txt''\")",
+      "Bash(python:*)",
+      "Bash(source venv/Scripts/activate)",
+      "Bash(pip install:*)",
+      "Bash(venv/Scripts/python.exe:*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(dir:*)",
+      "Bash(E:projectreaderstart.bat)",
+      "Bash(cmd.exe /c start.bat)",
+      "Bash(rm:*)",
+      "Bash(where:*)",
+      "Bash(C:Python311python.exe -m venv venv)",
+      "Bash(/c/Python311/python.exe -m venv:*)",
+      "Bash(venv/Scripts/pip:*)",
+      "WebSearch",
+      "Bash(powershell -Command \"Get-Content ''E:\\project\\reader\\app.py'' | Measure-Object -Line\")",
+      "Bash(venvScriptspython.exe app.py)",
+      "Bash(timeout /t 5 /nobreak)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(./venv/Scripts/pip:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(taskkill:*)",
+      "Bash(E:/project/reader/start.bat)",
+      "Bash(git init:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(.gitignore)",
+      "Bash(git commit:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
