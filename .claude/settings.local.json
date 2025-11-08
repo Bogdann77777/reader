@@ -30,7 +30,10 @@
       "Bash(git checkout:*)",
       "Bash(git add:*)",
       "Bash(.gitignore)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []
