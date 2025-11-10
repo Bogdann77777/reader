@@ -141,6 +141,79 @@ def scan_voices():
 
 
 # ============================================
+# Function: Analyze Sentence Structure
+# ============================================
+def analyze_sentence_structure(text):
+    """
+    Intelligent sentence analysis for natural phrase-level intonation
+    Analyzes sentence structure, not individual word stress
+    Identifies complex sentences that need internal pauses for clarity
+    """
+    sentences = []
+
+    # Split into sentences while preserving punctuation
+    raw_sentences = re.split(r'([.!?]+\s*)', text)
+
+    current_sentence = ""
+    for i, part in enumerate(raw_sentences):
+        if re.match(r'[.!?]+\s*', part):
+            current_sentence += part.strip()
+            if current_sentence:
+                sentence_info = {
+                    'text': current_sentence,
+                    'length': len(current_sentence),
+                    'type': 'question' if '?' in part else 'exclamation' if '!' in part else 'statement',
+                    'needs_split': False,
+                    'split_points': []
+                }
+
+                # Analyze if sentence is too long (>200 chars) and needs internal pauses
+                if len(current_sentence) > 200:
+                    sentence_info['needs_split'] = True
+
+                    # Find natural split points at conjunctions and clause boundaries
+                    # Russian conjunctions that indicate phrase boundaries
+                    conjunctions = [
+                        r',\s+(и|но|а|однако|поэтому|потому\s+что|так\s+как|если|когда|где|куда|откуда|чтобы|хотя|пока|как)\s+',
+                        r',\s+который',
+                        r',\s+что\s+',
+                        r';\s+'
+                    ]
+
+                    for pattern in conjunctions:
+                        for match in re.finditer(pattern, current_sentence, re.IGNORECASE):
+                            sentence_info['split_points'].append(match.start() + 1)  # After comma
+
+                # VERY long sentences (>400 chars) need additional splitting
+                # Even if no conjunctions found, split at commas for better comprehension
+                if len(current_sentence) > 400 and len(sentence_info['split_points']) < 2:
+                    sentence_info['needs_split'] = True
+
+                    # Find ALL commas in very long sentences for additional pause points
+                    for match in re.finditer(r',\s+', current_sentence):
+                        pos = match.start() + 1
+                        if pos not in sentence_info['split_points']:
+                            sentence_info['split_points'].append(pos)
+
+                sentences.append(sentence_info)
+                current_sentence = ""
+        else:
+            current_sentence += part
+
+    # Handle remaining text without sentence-ending punctuation
+    if current_sentence.strip():
+        sentences.append({
+            'text': current_sentence.strip(),
+            'length': len(current_sentence.strip()),
+            'type': 'statement',
+            'needs_split': len(current_sentence.strip()) > 200,
+            'split_points': []
+        })
+
+    return sentences
+
+
+# ============================================
 # Function: Clean Text
 # ============================================
 def clean_text(text):
@@ -243,6 +316,66 @@ def clean_text(text):
     # XTTS handles "2, 3, 4" naturally with commas - NO ELLIPSIS needed
     # Just ensure proper spacing
     text = re.sub(r'(\d+%?)\s*,\s*(?=\d)', r'\1, ', text)
+
+    # STEP 6f: INTELLIGENT SENTENCE STRUCTURE ANALYSIS
+    # Analyze long complex sentences and add natural phrase-level pauses
+    # This improves intonation for complex sentences without affecting short ones
+    try:
+        sentence_analysis = analyze_sentence_structure(text)
+
+        for sent_info in sentence_analysis:
+            if sent_info['needs_split'] and sent_info['split_points']:
+                original = sent_info['text']
+                modified = original
+
+                # Add extra commas at conjunction points in long sentences
+                # Work backwards to maintain position indices
+                for pos in sorted(sent_info['split_points'], reverse=True):
+                    # Only add comma if there isn't already strong punctuation
+                    if pos < len(modified):
+                        before = modified[:pos].rstrip()
+                        after = modified[pos:].lstrip()
+
+                        # Check if there's already a comma at this position
+                        if not before.endswith(',') and not before.endswith('.') and not before.endswith('!') and not before.endswith('?'):
+                            # CRITICAL FIX: Add space after comma to prevent XTTS from reading "слово,и" as one word
+                            # This was causing "ите", "уте" artifacts at word boundaries
+                            modified = before + ', ' + after
+
+                # Replace in text only if modification actually occurred
+                # Use safer replacement: only if original text appears exactly once
+                # or if we can find exact match position
+                if modified != original:
+                    count = text.count(original)
+                    if count == 1:
+                        # Safe to replace - only one occurrence
+                        text = text.replace(original, modified, 1)
+                    elif count > 1:
+                        # Multiple occurrences - skip to avoid wrong replacement
+                        # Let the later STEP 10 (normalize whitespace) handle cleanup
+                        print(f"[DEBUG] Skipping sentence replacement (found {count} duplicates): {original[:50]}...")
+                        pass
+
+    except Exception as e:
+        # If analysis fails, continue with original text (fail-safe)
+        print(f"[WARNING] Sentence analysis failed: {e}")
+        pass
+
+    # STEP 6g: POST-ANALYSIS CLEANUP
+    # Normalize spacing and punctuation after intelligent sentence analysis
+    # This ensures no artifacts from comma insertion (must run BEFORE newline removal)
+
+    # Remove multiple spaces around commas: "слово  ,  и" → "слово, и"
+    text = re.sub(r'\s*,\s*', ', ', text)
+
+    # Remove double/triple commas that might appear: "слово,, и" → "слово, и"
+    text = re.sub(r',{2,}', ',', text)
+
+    # Remove space before punctuation (safety net): "слово ," → "слово,"
+    text = re.sub(r'\s+,', ',', text)
+
+    # Ensure single space after comma: "слово,и" → "слово, и" (critical for XTTS)
+    text = re.sub(r',([^\s\d])', r', \1', text)
 
     # STEP 7: SMART NEWLINE HANDLING
     # Paragraph breaks (double newline) → single space (XTTS will pause naturally at sentence end)
@@ -569,9 +702,9 @@ def api_synthesize():
                 language=language,
                 file_path=str(output_path),
                 speed=speed,  # User-controlled reading speed
-                temperature=0.65,  # Back to 0.65 - 0.1 was too robotic
-                length_penalty=0.0,  # CRITICAL: Set to 0 - prevents slowdown at chunk end
-                repetition_penalty=2.5,  # Moderate penalty
+                temperature=0.75,  # Natural variability - per scope specification
+                length_penalty=1.0,  # Uniform speed control - prevents random acceleration/deceleration
+                repetition_penalty=5.0,  # High penalty to avoid monotony - per scope specification
                 enable_text_splitting=False  # CRITICAL: Don't let XTTS split text internally
             )
 

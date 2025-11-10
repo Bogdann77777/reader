@@ -33,7 +33,19 @@
       "Bash(git commit:*)",
       "Bash(git config:*)",
       "Bash(git remote add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(cmd.exe /c taskkill //F //IM python.exe)",
+      "Bash(powershell:*)",
+      "Bash(ipconfig:*)",
+      "Bash(findstr:*)",
+      "Bash(cmd.exe /c start_public.bat)",
+      "Bash(E:/project/reader/start_public.bat)",
+      "Bash(ssh:*)",
+      "Bash(timeout 5 ssh:*)",
+      "Bash(nul)",
+      "Bash(timeout:*)",
+      "Bash(bash -c \"cmd.exe /c ''''type start_public.bat | findstr /N echo''''\")",
+      "Bash(cmd.exe /c E:projectreaderstart_tunnel.bat)"
     ],
     "deny": [],
     "ask": []
