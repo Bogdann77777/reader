@@ -1,7 +1,6 @@
 Flask==3.0.0
 TTS==0.22.0
-torch==2.1.2
-torchaudio==2.1.2
+ruaccent
 numpy==1.24.3
 scipy==1.11.4
 soundfile==0.12.1

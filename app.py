@@ -1,10 +1,39 @@
 """
 TTS Reader - Flask Application
-A local text reader with XTTS v2 voice synthesis
+A local text reader with XTTS v2 multilingual voice synthesis
 """
 
 import os
 import sys
+import logging
+from datetime import datetime
+
+# CRITICAL FIX: PyTorch 2.9.0 environment variables
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"  # Disable weights_only strict loading
+os.environ["TORCHAUDIO_USE_BACKEND_DISPATCHER"] = "0"  # Force soundfile backend
+
+# Setup file logging FIRST
+log_file = f'server_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.info(f"="*80)
+logger.info(f"SERVER STARTED - Logging to {log_file}")
+logger.info(f"="*80)
+
+# CRITICAL FIX: Add ffmpeg to PATH before importing any libraries that might use it
+# Whisper (transformers) needs ffmpeg to process audio files for transcription
+venv_scripts = os.path.join(os.getcwd(), 'venv', 'Scripts')
+if venv_scripts not in os.environ['PATH']:
+    os.environ['PATH'] = venv_scripts + os.pathsep + os.environ['PATH']
+    logger.info(f"Added ffmpeg to PATH: {venv_scripts}")
+
 import re
 import glob
 import json
@@ -14,13 +43,43 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
 import torch
-from TTS.api import TTS
+from ruaccent import RUAccent
 import time
+import numpy as np
+import soundfile as sf
+
+# CRITICAL FIX: PyTorch 2.9.0+ requires safe_globals for custom classes in checkpoints
+# XTTS model uses multiple custom classes that need to be allowlisted
+try:
+    from TTS.tts.configs.xtts_config import XttsConfig
+    from TTS.tts.models.xtts import XttsAudioConfig, XttsArgs
+    from TTS.tts.layers.xtts.gpt import GPTConfig
+    from TTS.tts.layers.xtts.hifigan_decoder import HifiganConfig
+
+    torch.serialization.add_safe_globals([
+        XttsConfig,
+        XttsAudioConfig,
+        XttsArgs,
+        GPTConfig,
+        HifiganConfig
+    ])
+except Exception as e:
+    print(f"[WARNING] Could not add safe globals: {e}")
+    pass  # Fallback for older PyTorch versions
+
+from TTS.api import TTS
 
 # Fix encoding for Windows console to support Cyrillic
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
+
+# Force torchaudio to use soundfile backend for better compatibility
+# CRITICAL: PyTorch 2.9.0+cu128 tries to use torchcodec which has DLL issues on Windows
+os.environ['TORCHAUDIO_USE_BACKEND_DISPATCHER'] = '0'
+os.environ['TORCHAUDIO_BACKEND'] = 'soundfile'
+os.environ['TORCHAUDIO_INCLUDE_TORCHCODEC'] = '0'
+print("[INFO] Using torchaudio with soundfile backend (torchcodec forcefully disabled)")
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -30,37 +89,39 @@ CORS(app)
 CONFIG = {
     'SAMPLES_DIR': 'samples',
     'AUDIO_OUTPUT_DIR': 'audio_output',
-    'MODEL_NAME': 'tts_models/multilingual/multi-dataset/xtts_v2',
-    'DEVICE': 'cuda',  # GPU enabled: RTX 5060 Ti with SM 12.0 support via PyTorch nightly CUDA 12.8
+    'XTTS_MODEL': 'tts_models/multilingual/multi-dataset/xtts_v2',  # XTTS v2 multilingual model
+    'DEVICE': 'cuda',  # Using CUDA with PyTorch 2.9.0+cu128 (supports RTX 5060 Ti SM 12.0)
     'LANGUAGE': 'ru',
-    'MIN_SENTENCES': 10,  # Back to original - minimum sentences per chunk
-    'MAX_SENTENCES': 15,  # Back to original - maximum sentences per chunk
-    'MAX_CHARS': 600,     # Back to original - larger chunks
+    'MIN_SENTENCES': 3,   # minimum sentences per chunk
+    'MAX_SENTENCES': 10,  # maximum sentences per chunk
+    'MAX_CHARS': 800,     # max characters per chunk (XTTS can handle up to ~400 words)
 }
 
 # Global variables
-tts_model = None
+accentizer = None  # RUAccent for stress marking (optional for XTTS)
+tts_model = None   # XTTS model (loaded once at startup)
 current_chunks = []
-synthesis_lock = threading.Lock()  # CRITICAL: Prevent parallel synthesis on GPU (XTTS not thread-safe)
+synthesis_lock = threading.Lock()  # CRITICAL: Prevent parallel synthesis on GPU
 
 print(f"[INFO] Using device: {CONFIG['DEVICE']}")
 
 
 # ============================================
-# Function: Load TTS Model
+# Function: Load Models (RUAccent + XTTS)
 # ============================================
-def load_tts_model():
+def load_models():
     """
-    Load XTTS v2 model on startup
-    Returns: TTS model instance
+    Load RUAccent (optional) and XTTS v2 model
+    XTTS v2 is multilingual and does NOT require stress marks
+    Returns: tuple (accentizer, tts_model)
     """
-    global tts_model
+    global accentizer, tts_model
 
     try:
-        print("\n" + "="*60)
-        print("[INFO] Loading XTTS v2 model...")
-        print(f"[INFO] Model name: {CONFIG['MODEL_NAME']}")
-        print(f"[INFO] Target device: {CONFIG['DEVICE']}")
+        logger.info("="*80)
+        logger.info("Loading models...")
+        logger.info(f"XTTS Model: {CONFIG['XTTS_MODEL']}")
+        logger.info(f"Target device: {CONFIG['DEVICE']}")
 
         # Check CUDA availability
         if CONFIG['DEVICE'] == 'cuda':
@@ -74,31 +135,46 @@ def load_tts_model():
                     mem_total = torch.cuda.get_device_properties(i).total_memory / 1024**3
                     print(f"[INFO]   Total memory: {mem_total:.2f} GB")
 
-        print("[INFO] Initializing TTS model...")
+        # Load RUAccent (OPTIONAL for XTTS - can improve quality)
+        print("[INFO] Initializing RUAccent (optional for XTTS)...")
+        start_time = time.time()
+        try:
+            accentizer = RUAccent()
+            accentizer.load(omograph_model_size='turbo', use_dictionary=True)
+            load_time = time.time() - start_time
+            print(f"[SUCCESS] RUAccent loaded in {load_time:.2f} seconds")
+        except Exception as e:
+            print(f"[WARNING] RUAccent failed to load: {e}")
+            print("[INFO] Continuing without RUAccent (XTTS works fine without it)")
+            accentizer = None
+
+        # Load XTTS v2 model
+        print(f"[INFO] Loading XTTS v2 model: {CONFIG['XTTS_MODEL']}...")
         start_time = time.time()
 
-        tts_model = TTS(model_name=CONFIG['MODEL_NAME'])
+        tts_model = TTS(
+            model_name=CONFIG['XTTS_MODEL'],
+            progress_bar=True,
+            gpu=(CONFIG['DEVICE'] == 'cuda')
+        )
 
-        print(f"[INFO] Moving model to {CONFIG['DEVICE']}...")
-        tts_model = tts_model.to(CONFIG['DEVICE'])
+        # Move model to device
+        if CONFIG['DEVICE'] == 'cuda' and torch.cuda.is_available():
+            tts_model.to(CONFIG['DEVICE'])
 
         load_time = time.time() - start_time
-        print(f"[SUCCESS] Model loaded in {load_time:.2f} seconds")
+        logger.info(f"SUCCESS: XTTS model loaded in {load_time:.2f} seconds")
+        logger.info("XTTS v2 is multilingual (supports Russian without stress marks)")
 
-        if CONFIG['DEVICE'] == 'cuda' and torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(0) / 1024**3
-            print(f"[INFO] GPU memory allocated: {allocated:.2f} GB")
-
-        print("="*60 + "\n")
-        return tts_model
+        return accentizer, tts_model
 
     except Exception as e:
         print("\n" + "="*60)
-        print(f"[ERROR] Failed to load TTS model: {str(e)}")
+        print(f"[ERROR] Failed to load models: {str(e)}")
         print("[ERROR] Full traceback:")
         traceback.print_exc()
         print("="*60 + "\n")
-        return None
+        return None, None
 
 
 # ============================================
@@ -211,6 +287,361 @@ def analyze_sentence_structure(text):
         })
 
     return sentences
+
+
+# ============================================
+# Function: Analyze Text Emotion
+# ============================================
+def analyze_text_emotion(text):
+    """
+    Analyze emotional tone and context of text
+    Returns emotion parameters for TTS synthesis
+    """
+    emotion_data = {
+        'overall_emotion': 'neutral',
+        'intensity': 0.5,
+        'speed_modifier': 1.0,
+        'pause_modifier': 1.0,
+        'sections': []
+    }
+
+    # Emotion keywords and patterns (Russian)
+    emotion_patterns = {
+        'excitement': {
+            'keywords': ['восхитительно', 'удивительно', 'потрясающе', 'невероятно', 'фантастически'],
+            'intensity': 0.8,
+            'speed_modifier': 1.1,
+            'pause_modifier': 0.9
+        },
+        'sadness': {
+            'keywords': ['грустно', 'печально', 'тоскливо', 'уныло', 'скорбно', 'траурно'],
+            'intensity': 0.6,
+            'speed_modifier': 0.85,
+            'pause_modifier': 1.2
+        },
+        'anger': {
+            'keywords': ['возмутительно', 'недопустимо', 'ужасно', 'отвратительно', 'мерзко'],
+            'intensity': 0.9,
+            'speed_modifier': 1.15,
+            'pause_modifier': 0.8
+        },
+        'fear': {
+            'keywords': ['страшно', 'жутко', 'ужасающе', 'пугающе', 'тревожно', 'опасно'],
+            'intensity': 0.7,
+            'speed_modifier': 1.05,
+            'pause_modifier': 1.1
+        },
+        'joy': {
+            'keywords': ['радостно', 'весело', 'счастливо', 'празднично', 'ликующе', 'торжественно'],
+            'intensity': 0.75,
+            'speed_modifier': 1.05,
+            'pause_modifier': 0.95
+        },
+        'contemplative': {
+            'keywords': ['размышляя', 'думая', 'полагаю', 'возможно', 'вероятно', 'наверное'],
+            'intensity': 0.4,
+            'speed_modifier': 0.9,
+            'pause_modifier': 1.15
+        }
+    }
+
+    # Analyze text sections
+    text_lower = text.lower()
+    emotion_scores = {}
+
+    # Count emotion indicators
+    for emotion, data in emotion_patterns.items():
+        score = 0
+        for keyword in data['keywords']:
+            score += text_lower.count(keyword)
+        emotion_scores[emotion] = score
+
+    # Determine dominant emotion
+    if sum(emotion_scores.values()) > 0:
+        dominant_emotion = max(emotion_scores, key=emotion_scores.get)
+        emotion_data['overall_emotion'] = dominant_emotion
+        emotion_data['intensity'] = emotion_patterns[dominant_emotion]['intensity']
+        emotion_data['speed_modifier'] = emotion_patterns[dominant_emotion]['speed_modifier']
+        emotion_data['pause_modifier'] = emotion_patterns[dominant_emotion]['pause_modifier']
+
+    # Analyze punctuation for additional emotional cues
+    exclamation_count = text.count('!')
+    question_count = text.count('?')
+    ellipsis_count = text.count('...')
+
+    # Adjust parameters based on punctuation
+    if exclamation_count > 3:
+        emotion_data['intensity'] = min(1.0, emotion_data['intensity'] + 0.2)
+        emotion_data['speed_modifier'] *= 1.05
+
+    if question_count > 5:
+        emotion_data['pause_modifier'] *= 1.1  # More pauses for rhetorical questions
+
+    if ellipsis_count > 2:
+        emotion_data['speed_modifier'] *= 0.95  # Slower for contemplative text
+        emotion_data['pause_modifier'] *= 1.2
+
+    # Detect dialogue markers
+    if '"' in text or '«' in text or '—' in text:
+        emotion_data['has_dialogue'] = True
+    else:
+        emotion_data['has_dialogue'] = False
+
+    logger.info(f"Emotion analysis: {emotion_data['overall_emotion']} "
+                f"(intensity: {emotion_data['intensity']:.2f}, "
+                f"speed: {emotion_data['speed_modifier']:.2f})")
+
+    return emotion_data
+
+
+# ============================================
+# Function: Calculate Dynamic Speed
+# ============================================
+def calculate_dynamic_speed(text, base_speed=1.0, emotion_data=None):
+    """
+    Calculate dynamic reading speed based on text complexity and emotion
+    Adjusts speed for difficult words, numbers, abbreviations
+    """
+    speed_data = {
+        'base_speed': base_speed,
+        'segments': []
+    }
+
+    # Complexity patterns that require slower reading
+    complexity_patterns = {
+        'technical_terms': {
+            'pattern': r'\b[A-Z]{2,}(?:[a-z]+)?(?:\d+)?\b',  # API, XMLHttpRequest, HTML5
+            'speed_modifier': 0.85,
+            'description': 'technical abbreviations'
+        },
+        'numbers': {
+            'pattern': r'\d+(?:[.,]\d+)?(?:%|₽|\$|€)?',  # Numbers with units
+            'speed_modifier': 0.9,
+            'description': 'numbers and percentages'
+        },
+        'scientific': {
+            'pattern': r'\b(?:квант|молекул|атом|ген|нейро|био|хим|физ|матем)\w+\b',
+            'speed_modifier': 0.88,
+            'description': 'scientific terminology'
+        },
+        'foreign_words': {
+            'pattern': r'\b[A-Za-z]+(?:-[A-Za-z]+)*\b',  # English words in Russian text
+            'speed_modifier': 0.87,
+            'description': 'foreign language words'
+        },
+        'complex_words': {
+            'pattern': r'\b\w{15,}\b',  # Very long words (15+ chars)
+            'speed_modifier': 0.85,
+            'description': 'complex long words'
+        }
+    }
+
+    # Split text into sentences for segment analysis
+    import re
+    sentences = re.split(r'([.!?]+)', text)
+
+    current_position = 0
+    for i in range(0, len(sentences), 2):
+        if i >= len(sentences):
+            break
+
+        sentence = sentences[i]
+        if not sentence.strip():
+            continue
+
+        # Base speed for this segment
+        segment_speed = base_speed
+
+        # Apply emotion modifier if available
+        if emotion_data:
+            segment_speed *= emotion_data.get('speed_modifier', 1.0)
+
+        # Analyze complexity
+        complexity_score = 0
+        complexity_factors = []
+
+        for pattern_name, pattern_data in complexity_patterns.items():
+            matches = re.findall(pattern_data['pattern'], sentence, re.IGNORECASE)
+            if matches:
+                complexity_score += len(matches)
+                complexity_factors.append(f"{pattern_data['description']}: {len(matches)}")
+                # Apply strongest modifier
+                segment_speed = min(segment_speed, base_speed * pattern_data['speed_modifier'])
+
+        # Check sentence length (longer sentences read slightly slower)
+        word_count = len(sentence.split())
+        if word_count > 20:
+            segment_speed *= 0.95
+            complexity_factors.append(f"long sentence: {word_count} words")
+
+        # Check for lists or enumerations (read slightly slower for clarity)
+        if re.search(r'(?:во-первых|во-вторых|первое|второе|\d+\)|\d+\.)', sentence):
+            segment_speed *= 0.92
+            complexity_factors.append("enumeration detected")
+
+        # Important text markers (emphasis, slower)
+        if any(marker in sentence.upper() for marker in ['ВАЖНО', 'ВНИМАНИЕ', 'КРИТИЧНО', 'КЛЮЧЕВОЙ']):
+            segment_speed *= 0.88
+            complexity_factors.append("important text marker")
+
+        # Dialogue adjustments (more natural pacing)
+        if '"' in sentence or '«' in sentence or '—' in sentence:
+            segment_speed *= 1.02  # Slightly faster for natural dialogue
+            complexity_factors.append("dialogue")
+
+        # Store segment data
+        segment_data = {
+            'start': current_position,
+            'end': current_position + len(sentence),
+            'text': sentence[:50] + '...' if len(sentence) > 50 else sentence,
+            'speed': round(segment_speed, 2),
+            'complexity_score': complexity_score,
+            'factors': complexity_factors
+        }
+        speed_data['segments'].append(segment_data)
+
+        current_position += len(sentence)
+        if i + 1 < len(sentences):
+            current_position += len(sentences[i + 1])  # Add punctuation length
+
+    # Calculate average speed
+    if speed_data['segments']:
+        avg_speed = sum(s['speed'] for s in speed_data['segments']) / len(speed_data['segments'])
+        speed_data['average_speed'] = round(avg_speed, 2)
+    else:
+        speed_data['average_speed'] = base_speed
+
+    logger.info(f"Dynamic speed calculated: avg={speed_data['average_speed']}, "
+                f"segments={len(speed_data['segments'])}")
+
+    return speed_data
+
+
+# ============================================
+# Function: Select Voice for Context
+# ============================================
+def select_voice_for_context(text, available_voices, emotion_data=None):
+    """
+    Select appropriate voice based on text context
+    Supports multiple voices for dialogues, narration, quotes
+    """
+    voice_selection = {
+        'primary_voice': None,
+        'voice_map': {},  # Maps text segments to specific voices
+        'dialogue_voices': [],
+        'narrator_voice': None
+    }
+
+    # Analyze text for different voice contexts
+    context_patterns = {
+        'dialogue': {
+            'pattern': r'[«"]([^»"]+)[»"]',  # Quoted speech
+            'voice_type': 'character'
+        },
+        'thoughts': {
+            'pattern': r'[\(«]([^)»]+)[\)»]',  # Thoughts or internal monologue
+            'voice_type': 'internal'
+        },
+        'emphasis': {
+            'pattern': r'[A-ZА-Я]{3,}(?:\s+[A-ZА-Я]{3,})*',  # ALL CAPS emphasis
+            'voice_type': 'emphatic'
+        },
+        'narrator': {
+            'pattern': r'^[^«"—]+',  # Non-dialogue text
+            'voice_type': 'narrator'
+        }
+    }
+
+    # If we don't have multiple voices, return the first available
+    if len(available_voices) <= 1:
+        voice_selection['primary_voice'] = available_voices[0] if available_voices else None
+        logger.info("Single voice mode - using primary voice for all text")
+        return voice_selection
+
+    # Assign voices based on context
+    # Strategy: Different voices for dialogue speakers
+    voice_selection['narrator_voice'] = available_voices[0]  # First voice for narration
+    voice_selection['primary_voice'] = available_voices[0]
+
+    # Detect dialogue and assign alternating voices
+    dialogue_matches = re.findall(context_patterns['dialogue']['pattern'], text)
+    if dialogue_matches:
+        # Use different voices for different speakers (simple alternation)
+        speaker_voices = {}
+        voice_index = 1  # Start from second voice for dialogue
+
+        # Try to detect different speakers by analyzing text before quotes
+        speaker_pattern = r'(\w+)\s+(?:сказал|говорит|спросил|ответил|произнес|воскликнул)[:\s]*[«"]'
+        speakers = re.findall(speaker_pattern, text, re.IGNORECASE)
+
+        for i, speaker in enumerate(speakers):
+            if speaker not in speaker_voices:
+                if voice_index < len(available_voices):
+                    speaker_voices[speaker] = available_voices[voice_index]
+                    voice_index = (voice_index + 1) % len(available_voices)
+                    if voice_index == 0:
+                        voice_index = 1  # Skip narrator voice
+                else:
+                    speaker_voices[speaker] = available_voices[1] if len(available_voices) > 1 else available_voices[0]
+
+        voice_selection['dialogue_voices'] = list(speaker_voices.values())
+
+        # Create voice map for text segments
+        current_pos = 0
+        for match in re.finditer(context_patterns['dialogue']['pattern'], text):
+            start, end = match.span()
+
+            # Add narrator segment before dialogue
+            if current_pos < start:
+                voice_selection['voice_map'][f"{current_pos}-{start}"] = {
+                    'voice': voice_selection['narrator_voice'],
+                    'type': 'narrator',
+                    'text': text[current_pos:start][:50]
+                }
+
+            # Add dialogue segment
+            dialogue_text = match.group(1)
+            # Try to identify speaker for this dialogue
+            speaker_voice = available_voices[1] if len(available_voices) > 1 else available_voices[0]
+
+            # Check if we can identify the speaker
+            pre_text = text[max(0, start-100):start]
+            for speaker, voice in speaker_voices.items():
+                if speaker in pre_text:
+                    speaker_voice = voice
+                    break
+
+            voice_selection['voice_map'][f"{start}-{end}"] = {
+                'voice': speaker_voice,
+                'type': 'dialogue',
+                'text': dialogue_text[:50]
+            }
+
+            current_pos = end
+
+        # Add final narrator segment
+        if current_pos < len(text):
+            voice_selection['voice_map'][f"{current_pos}-{len(text)}"] = {
+                'voice': voice_selection['narrator_voice'],
+                'type': 'narrator',
+                'text': text[current_pos:][:50]
+            }
+
+    # Apply emotion-based voice selection hints
+    if emotion_data:
+        emotion = emotion_data.get('overall_emotion', 'neutral')
+
+        # For strong emotions, prefer voices with matching characteristics
+        # This is a placeholder for voice characteristic matching
+        if emotion in ['excitement', 'joy'] and len(available_voices) > 2:
+            voice_selection['primary_voice'] = available_voices[2]  # Assume third voice is more energetic
+        elif emotion in ['sadness', 'contemplative'] and len(available_voices) > 1:
+            voice_selection['primary_voice'] = available_voices[1]  # Assume second voice is calmer
+
+    logger.info(f"Voice selection: {len(voice_selection['voice_map'])} segments mapped, "
+                f"{len(voice_selection['dialogue_voices'])} dialogue voices")
+
+    return voice_selection
 
 
 # ============================================
@@ -640,6 +1071,20 @@ def api_synthesize():
                 'error': 'Empty text chunk'
             }), 400
 
+        # Analyze emotion and context
+        emotion_data = analyze_text_emotion(text_stripped)
+        speed_data = calculate_dynamic_speed(text_stripped, speed, emotion_data)
+
+        # Get all available voices for context selection
+        available_voice_paths = [v['path'] for v in scan_voices()]
+        voice_selection = select_voice_for_context(text_stripped, available_voice_paths, emotion_data)
+
+        # Use selected voice if different from requested
+        if voice_selection.get('primary_voice') and voice_selection['primary_voice'] != voice_path:
+            logger.info(f"Context suggests using voice: {voice_selection['primary_voice']}")
+            # For now, we'll use the requested voice but log the suggestion
+            # In future, we can switch voices dynamically
+
         # DEBUG: Show EXACT text sent to XTTS (all characters visible)
         print(f"\n{'='*60}")
         print(f"[DEBUG] CHUNK {chunk_index} - EXACT TEXT TO XTTS:")
@@ -648,11 +1093,11 @@ def api_synthesize():
         print(f"[DEBUG] First 100 chars: {text_stripped[:100]}")
         print(f"{'='*60}\n")
 
-        # Check if model is loaded
+        # Check if XTTS model is loaded
         if tts_model is None:
             return jsonify({
                 'success': False,
-                'error': 'TTS model not loaded'
+                'error': 'XTTS model not loaded'
             }), 500
 
         # CRITICAL: Acquire lock to prevent parallel synthesis (XTTS not thread-safe on GPU)
@@ -668,7 +1113,6 @@ def api_synthesize():
             print(f"\n[INFO] ⚙️ Synthesizing chunk {chunk_index} [LOCK ACQUIRED]")
             print(f"[INFO]   Text length: {len(text_stripped)} chars")
             print(f"[INFO]   Voice: {voice_path_abs}")
-            print(f"[INFO]   Speed: {speed}x")
             print(f"[INFO]   Language: {language}")
             print(f"[DEBUG]   Text preview: {text_stripped[:100]}...")
 
@@ -683,30 +1127,73 @@ def api_synthesize():
 
             start_time = time.time()
 
-            # CRITICAL: Clean chunk text to prevent artifacts
-            # Remove trailing commas/spaces that cause duplication
+            # Clean chunk text
             text_for_tts = text_stripped.rstrip(',;: \t')
-
-            # CRITICAL FIX: Ensure ends with period + add continuation text
-            # This prevents XTTS from "slowing down" at chunk end
             if text_for_tts and text_for_tts[-1] not in '.!?':
                 text_for_tts += '.'
 
-            # Synthesize using XTTS v2
-            print(f"[INFO] Starting TTS synthesis...")
-            print(f"[DEBUG] Final text for XTTS: {repr(text_for_tts[:100])}...")
+            # XTTS v2 does NOT need stress marks! Model trained on clean text
+            # RUAccent stress marks (БАРЬ+ЕР) break XTTS synthesis completely!
+            # Keeping text clean for XTTS
+            logger.info(f"Using clean text for XTTS (NO stress marks needed)")
 
-            tts_model.tts_to_file(
-                text=text_for_tts,
-                speaker_wav=voice_path_abs,
-                language=language,
-                file_path=str(output_path),
-                speed=speed,  # User-controlled reading speed
-                temperature=0.75,  # Natural variability - per scope specification
-                length_penalty=1.0,  # Uniform speed control - prevents random acceleration/deceleration
-                repetition_penalty=5.0,  # High penalty to avoid monotony - per scope specification
-                enable_text_splitting=False  # CRITICAL: Don't let XTTS split text internally
-            )
+            print(f"[INFO] Starting XTTS synthesis...")
+            print(f"[DEBUG] Text to synthesize: {text_for_tts[:100]}...")
+
+            # Retry mechanism with exponential backoff
+            max_retries = 3
+            retry_delay = 1.0  # Start with 1 second
+
+            for attempt in range(max_retries):
+                try:
+                    # Use dynamic speed from analysis
+                    synthesis_speed = speed_data.get('average_speed', 1.0)
+                    logger.info(f"Using dynamic speed: {synthesis_speed:.2f} (base: {speed})")
+
+                    if attempt > 0:
+                        logger.info(f"Retry attempt {attempt + 1}/{max_retries} for chunk {chunk_index}")
+
+                    # Call XTTS tts_to_file method
+                    # XTTS only needs speaker_wav (reference audio), NO reference text needed
+                    tts_model.tts_to_file(
+                        text=text_for_tts,
+                        file_path=str(output_path),
+                        speaker_wav=voice_path_abs,
+                        language=language,
+                        speed=synthesis_speed,
+                        # XTTS-specific PRODUCTION quality parameters
+                        # Based on official Coqui TTS recommendations and community best practices
+                        temperature=0.65,  # Lower = more stable, less artifacts (0.65-0.7 recommended)
+                        length_penalty=1.0,  # Controls output length
+                        repetition_penalty=10.0,  # CRITICAL: Default 10.0 prevents repetition/artifacts
+                        top_k=50,  # Top-k sampling diversity
+                        top_p=0.85,  # Nucleus sampling
+                        gpt_cond_len=6,  # Use 6 seconds of reference audio for better cloning
+                        enable_text_splitting=True,  # Better handling of long texts
+                    )
+
+                    print(f"[DEBUG] Synthesis complete")
+
+                    # Success - break the retry loop
+                    break
+
+                except Exception as e:
+                    print(f"[ERROR] XTTS synthesis failed (attempt {attempt + 1}): {str(e)}")
+
+                    if attempt < max_retries - 1:
+                        # Wait before retry with exponential backoff
+                        print(f"[INFO] Waiting {retry_delay:.1f}s before retry...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+
+                        # Clear GPU cache before retry
+                        if CONFIG['DEVICE'] == 'cuda' and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    else:
+                        # Final attempt failed
+                        print(f"[ERROR] All {max_retries} attempts failed for chunk {chunk_index}")
+                        traceback.print_exc()
+                        raise Exception(f"XTTS synthesis failed after {max_retries} attempts: {str(e)}")
 
             synthesis_time = time.time() - start_time
 
@@ -750,12 +1237,14 @@ def api_synthesize():
         print("="*60 + "\n")
 
         # Provide user-friendly error message
-        if 'index out of range' in error_msg:
+        if 'index out of range' in error_msg or 'tokenizer' in error_msg.lower():
             error_msg = f"Text processing error in chunk {chunk_index}. The chunk may be too complex or contain unsupported characters."
         elif 'out of memory' in error_msg.lower():
             error_msg = f"GPU out of memory in chunk {chunk_index}. Try reducing chunk size or switching to CPU."
         elif 'CUDA' in error_msg.upper() or 'GPU' in error_msg.upper():
             error_msg = f"GPU error in chunk {chunk_index}: {error_msg}"
+        elif 'speaker_wav' in error_msg.lower():
+            error_msg = f"Voice sample error in chunk {chunk_index}. Check that the voice file is valid."
 
         return jsonify({
             'success': False,
@@ -867,11 +1356,16 @@ def save_position():
 # ============================================
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("TTS Reader - Starting Application")
+    print("TTS Reader - Starting Application (XTTS v2)")
     print("="*50 + "\n")
 
-    # Load TTS model
-    load_tts_model()
+    # Load models (RUAccent + XTTS)
+    load_models()
+
+    # Check if XTTS model loaded successfully
+    if tts_model is None:
+        print("[ERROR] Failed to load XTTS model. Exiting.")
+        sys.exit(1)
 
     # Scan for voices
     voices = scan_voices()
@@ -880,13 +1374,13 @@ if __name__ == '__main__':
         print("[INFO] Add WAV files to 'samples/' directory for voice cloning")
 
     print("\n" + "="*50)
-    print("Server starting at http://localhost:5000")
+    print("Server starting at http://localhost:9000")
     print("="*50 + "\n")
 
     # Run Flask app
     app.run(
         host='0.0.0.0',
-        port=5000,
+        port=9000,
         debug=True,
         use_reloader=False,  # Prevent double model loading
         threaded=True  # CRITICAL: Enable multi-threading for parallel prefetch requests

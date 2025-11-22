@@ -91,6 +91,7 @@ async function loadVoices() {
     } catch (error) {
         console.error('[ERROR] Failed to load voices:', error);
         elements.voiceSelect.innerHTML = '<option value="">Error loading voices</option>';
+        showErrorNotification('Failed to load voice samples', 'error');
     }
 }
 
@@ -257,7 +258,7 @@ async function handleFileUpload(file) {
 
     } catch (error) {
         console.error('[ERROR] File upload failed:', error);
-        alert('Failed to load file: ' + error.message);
+        showErrorNotification(`Failed to load file: ${error.message}`, 'error');
         updateStatus('Error');
     }
 }
@@ -351,6 +352,10 @@ async function synthesizeChunk(chunkIndex) {
         // Log error but return null instead of throwing (skip problematic chunks)
         console.error(`[ERROR] Chunk ${chunkIndex} failed: ${result.error}`);
         console.warn(`[WARNING] Skipping chunk ${chunkIndex} due to synthesis error`);
+
+        // Show user notification about the error
+        showErrorNotification(`Chunk ${chunkIndex + 1} failed: ${result.error}`, 'warning');
+
         return null;
     }
 
@@ -479,7 +484,7 @@ async function playNextChunk() {
         
         if (state.consecutiveErrors >= maxSkips) {
             console.error(`[ERROR] Too many consecutive errors (${state.consecutiveErrors}), stopping playback`);
-            alert(`Playback stopped after ${maxSkips} consecutive errors.`);
+            showErrorNotification(`Playback stopped after ${maxSkips} consecutive errors`, 'error');
             stopReading();
             state.consecutiveErrors = 0;
             return;
@@ -571,6 +576,9 @@ function finishReading() {
     elements.stopBtn.disabled = true;
 
     console.log('[INFO] Reading completed');
+
+    // Show success notification
+    showErrorNotification('Reading completed successfully!', 'success');
 
     // Cleanup audio files
     cleanupAudio();
@@ -798,7 +806,116 @@ function stopCurrentAudio() {
 
 
 // ============================================
+// Error Notification System
+// ============================================
+function showErrorNotification(message, type = 'error') {
+    // Create notification container if it doesn't exist
+    let notificationContainer = document.getElementById('notification-container');
+    if (!notificationContainer) {
+        notificationContainer = document.createElement('div');
+        notificationContainer.id = 'notification-container';
+        notificationContainer.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 10000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-width: 400px;
+        `;
+        document.body.appendChild(notificationContainer);
+    }
+
+    // Create notification element
+    const notification = document.createElement('div');
+    notification.className = `notification notification-${type}`;
+    notification.style.cssText = `
+        background: ${type === 'error' ? '#ef4444' : type === 'warning' ? '#f59e0b' : '#10b981'};
+        color: white;
+        padding: 12px 16px;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        animation: slideIn 0.3s ease-out;
+        cursor: pointer;
+        word-wrap: break-word;
+    `;
+
+    // Add animation styles if not already present
+    if (!document.getElementById('notification-styles')) {
+        const style = document.createElement('style');
+        style.id = 'notification-styles';
+        style.textContent = `
+            @keyframes slideIn {
+                from {
+                    transform: translateX(100%);
+                    opacity: 0;
+                }
+                to {
+                    transform: translateX(0);
+                    opacity: 1;
+                }
+            }
+            @keyframes fadeOut {
+                from {
+                    opacity: 1;
+                }
+                to {
+                    opacity: 0;
+                    transform: translateY(-10px);
+                }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // Add close functionality on click
+    notification.onclick = function() {
+        notification.style.animation = 'fadeOut 0.3s ease-out';
+        setTimeout(() => notification.remove(), 300);
+    };
+
+    // Set notification content
+    notification.innerHTML = `
+        <div style="display: flex; align-items: start; gap: 8px;">
+            <span style="font-size: 16px;">
+                ${type === 'error' ? '❌' : type === 'warning' ? '⚠️' : '✓'}
+            </span>
+            <div style="flex: 1;">
+                <div style="font-weight: 600; margin-bottom: 2px;">
+                    ${type === 'error' ? 'Error' : type === 'warning' ? 'Warning' : 'Success'}
+                </div>
+                <div>${message}</div>
+            </div>
+        </div>
+    `;
+
+    // Add to container
+    notificationContainer.appendChild(notification);
+
+    // Auto-remove after 5 seconds for warnings/success, 10 seconds for errors
+    const timeout = type === 'error' ? 10000 : 5000;
+    setTimeout(() => {
+        if (notification.parentNode) {
+            notification.style.animation = 'fadeOut 0.3s ease-out';
+            setTimeout(() => notification.remove(), 300);
+        }
+    }, timeout);
+
+    // Log to console as well
+    const logMethod = type === 'error' ? 'error' : type === 'warning' ? 'warn' : 'log';
+    console[logMethod](`[NOTIFICATION] ${message}`);
+}
+
+// Export for global use
+window.showErrorNotification = showErrorNotification;
+
+
+// ============================================
 // Console Banner
 // ============================================
 console.log('%c TTS Reader v1.0 ', 'background: #2563eb; color: white; font-size: 16px; padding: 4px 8px; border-radius: 4px;');
-console.log('%c Powered by XTTS v2 ', 'color: #64748b; font-size: 12px;');
+console.log('%c Powered by F5-TTS Russian ', 'color: #64748b; font-size: 12px;');
